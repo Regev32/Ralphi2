@@ -1,0 +1,18 @@
+{
+  "donors_folder": "data/typing",
+  "donors_file": "ezer_mizion_16",
+  "allowed_loci": ["A", "B", "C", "DRB1", "DQB1"],
+  "first_row_headers": false,
+  "graph_path": "graphs",
+  "output_html": "hla_graph.html",
+  "nodes_list": "nodes.json",
+
+  "episodes":   500,
+  "lr":         1e-4,
+  "gamma":      0.99,
+  "alpha":      1,
+  "max_steps":  2000,
+
+  "save_model": "models/actor_critic.pth",
+  "logdir":     "runs"
+}
