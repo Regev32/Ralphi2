@@ -5,158 +5,172 @@ import pickle
 import random
 import itertools
 import csv
-import statistics
 
 import networkx as nx
-import numpy as np
 import torch
 
 from graph_actor_critic import GraphPartitionEnv, ActorCritic
 
-# --- Load config & paths ---
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-with open(os.path.join(BASE_DIR, 'config.json')) as f:
-    cfg = json.load(f)
 
-n_sub     = cfg.get('n_subgraphs', 10)
-graph_dir = os.path.join(BASE_DIR, cfg['graph_path'])
-full_pkl  = os.path.join(graph_dir, cfg['donors_file'] + '.pkl')
-alleles_j = os.path.join(graph_dir, cfg['donors_file'] + '_loci.json')
-model_pth = os.path.join(BASE_DIR, cfg['save_model'])
-donors_csv= os.path.join(BASE_DIR,
-                         cfg['donors_folder'],
-                         cfg['donors_file'] + '.csv')
-
-# Number of greedy rollouts per HLA to take max over
-N_TRIALS = 20
-# Number of real HLAs to include
-N_REAL   = 5
-
-# --- Load data ---
-G_full = pickle.load(open(full_pkl, 'rb'))
-with open(alleles_j) as f:
-    alleles_by_locus = json.load(f)
-loci = list(alleles_by_locus.keys())
-
-# --- Pull real HLAs from your CSV file ---
-real_hlas = []
-with open(donors_csv) as f:
-    if cfg.get('first_row_headers', False):
-        next(f)
-    for line in f:
-        parts = line.strip().split(',')
-        if len(parts) > 1 and parts[1].strip():
-            real_hlas.append(parts[1].strip())
-# Sample up to N_REAL unique entries
-real_hlas = random.sample(real_hlas, min(N_REAL, len(real_hlas)))
-
-# --- Helpers ---
-def random_hla_string():
+def random_hla_string(alleles_by_locus, loci):
     parts = []
     for locus in loci:
         grp = []
         for _ in range(2):
-            k = random.choice([1,2,3])
+            k = random.choice([1, 2, 3])
             picks = random.sample(alleles_by_locus[locus], k)
             grp.append("/".join(picks))
         parts.append("+".join(grp))
     return "^".join(parts)
 
+
 def make_subgraph_for_hla(G_full, hla_string):
     groups = [
         chunk.strip()
         for locus_part in hla_string.split('^')
-        for chunk     in locus_part.split('+')
+        for chunk in locus_part.split('+')
         if chunk.strip()
     ]
-    var2grp = {v: grp for grp in groups for v in grp.split('/')}
+    var2grp = {allele: grp for grp in groups for allele in grp.split('/')}
+    valid = [
+        grp for grp in groups
+        if any(allele in G_full for allele in grp.split('/'))
+    ]
 
-    valid = [grp for grp in groups
-             if any(v in G_full for v in grp.split('/'))]
+    subG = nx.Graph()
+    subG.add_nodes_from(valid)
 
-    sub = nx.Graph()
-    sub.add_nodes_from(valid)
     for grp in valid:
-        for v in grp.split('/'):
-            if v not in G_full: continue
-            for nbr, data in G_full[v].items():
+        for allele in grp.split('/'):
+            if allele not in G_full:
+                continue
+            for nbr, data in G_full[allele].items():
                 if nbr in var2grp:
                     tgt = var2grp[nbr]
-                    if tgt == grp: continue
+                    if tgt == grp:
+                        continue
                     w = data.get('weight', 1.0)
-                    if sub.has_edge(grp, tgt):
-                        sub[grp][tgt]['weight'] += w
+                    if subG.has_edge(grp, tgt):
+                        subG[grp][tgt]['weight'] += w
                     else:
-                        sub.add_edge(grp, tgt, weight=w)
-    return sub
+                        subG.add_edge(grp, tgt, weight=w)
+    return subG
+
+
+def calculate_clique_weight(clique_nodes, subG):
+    total = 0.0
+    for u, v in itertools.combinations(clique_nodes, 2):
+        if subG.has_edge(u, v):
+            total += subG[u][v]['weight']
+    return total
+
 
 def brute_force_best(subG):
     nodes = list(subG.nodes())
-    best  = -np.inf
-    for assign in itertools.product([1,-1], repeat=len(nodes)):
-        w = 0.0
-        for sign in (1, -1):
-            clique = [nodes[i] for i,a in enumerate(assign) if a==sign]
-            for u,v in itertools.combinations(clique, 2):
-                if subG.has_edge(u,v):
-                    w += subG[u][v]['weight']
-        best = max(best, w)
+    best = -float('inf')
+    for assign in itertools.product([1, -1], repeat=len(nodes)):
+        clique1 = [nodes[i] for i, a in enumerate(assign) if a == 1]
+        clique2 = [nodes[i] for i, a in enumerate(assign) if a == -1]
+        w1 = calculate_clique_weight(clique1, subG)
+        w2 = calculate_clique_weight(clique2, subG)
+        best = max(best, w1 + w2)
     return best
 
-def eval_ac_greedy(hla_string, model):
+
+def eval_ac_greedy(hla_string, model, G_full, cfg):
     env = GraphPartitionEnv(hla_string, cfg)
     state = env.reset()
-    done  = False
+    if isinstance(state, tuple):
+        state = state[0]
+
+    done = False
     while not done:
-        st     = torch.from_numpy(state).float()
+        st = torch.from_numpy(state).float()
         probs, _ = model(st)
         action = torch.argmax(probs).item()
-        state, _, done, _ = env.step(action)
-    return env._calc_weight()
+        out = env.step(action)
+        state, _, done, _ = out
 
-def eval_ac_best_of_n(hla, model, n=N_TRIALS):
+    clique1, clique2 = env.cliques
+    subG = make_subgraph_for_hla(G_full, hla_string)
+    return calculate_clique_weight(clique1, subG) + calculate_clique_weight(clique2, subG)
+
+
+def eval_ac_best_of_n(hla_string, model, G_full, cfg, n_trials=20):
     best = -float('inf')
-    for _ in range(n):
-        score = eval_ac_greedy(hla, model)
-        best  = max(best, score)
+    for _ in range(n_trials):
+        score = eval_ac_greedy(hla_string, model, G_full, cfg)
+        best = max(best, score)
     return best
 
-# --- Load trained AC model ---
-dummy = GraphPartitionEnv(random_hla_string(), cfg)
-model = ActorCritic(
-    state_dim = dummy.observation_space.shape[0],
-    action_dim= dummy.action_space.n
-)
-model.load_state_dict(torch.load(model_pth, map_location='cpu'))
-model.eval()
 
-# --- Run tests & collect results ---
-results = []
+def main():
+    # --- Load config & paths ---
+    BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+    with open(os.path.join(BASE_DIR, 'config.json')) as f:
+        cfg = json.load(f)
 
-# First, the real HLAs
-for hla in real_hlas:
-    subG   = make_subgraph_for_hla(G_full, hla)
-    brute  = brute_force_best(subG)
-    ac_scr = eval_ac_best_of_n(hla, model)
-    results.append((hla, brute, ac_scr))
-    print(f"REAL    | brute={brute:.3f}, AC(best of {N_TRIALS})={ac_scr:.3f}")
+    graph_dir = os.path.join(BASE_DIR, cfg['graph_path'])
+    full_pkl = os.path.join(graph_dir, cfg['donors_file'] + '.pkl')
+    alleles_j = os.path.join(graph_dir, cfg['donors_file'] + '_loci.json')
+    model_pth = os.path.join(BASE_DIR, cfg['save_model'])
+    donors_csv = os.path.join(BASE_DIR, cfg['donors_folder'], cfg['donors_file'] + '.csv')
 
-# Then, n_sub random HLAs
-for i in range(1, n_sub+1):
-    hla    = random_hla_string()
-    subG   = make_subgraph_for_hla(G_full, hla)
-    brute  = brute_force_best(subG)
-    ac_scr = eval_ac_best_of_n(hla, model)
-    results.append((hla, brute, ac_scr))
-    print(f"[{i}/{n_sub}] RANDOM | brute={brute:.3f}, AC(best of {N_TRIALS})={ac_scr:.3f}")
+    N_REAL = cfg.get('n_real_hlas', 5)
+    N_TRIALS = cfg.get('n_trials', 20)
+    n_sub = cfg.get('n_subgraphs', 10)
 
-# --- Write CSV next to your loci JSON (in graphs/) ---
-out_csv = os.path.join(graph_dir, 'test_results.csv')
-with open(out_csv, 'w', newline='') as cf:
-    writer = csv.writer(cf)
-    writer.writerow(['HLA',
-                     'score_with_brute_force',
-                     'score_with_actor_critic'])
-    writer.writerows(results)
+    # --- Load data ---
+    G_full = pickle.load(open(full_pkl, 'rb'))
+    with open(alleles_j) as f:
+        alleles_by_locus = json.load(f)
+    loci = list(alleles_by_locus.keys())
 
-print(f"\nSaved results to {out_csv}")
+    # --- Select real HLAs ---
+    real_hlas = []
+    with open(donors_csv) as f:
+        if cfg.get('first_row_headers', False):
+            next(f)
+        for line in f:
+            parts = line.strip().split(',')
+            if len(parts) > 1 and parts[1].strip():
+                real_hlas.append(parts[1].strip())
+    real_hlas = random.sample(real_hlas, min(N_REAL, len(real_hlas)))
+
+    # --- Load model ---
+    dummy = GraphPartitionEnv(random_hla_string(alleles_by_locus, loci), cfg)
+    model = ActorCritic(
+        state_dim=dummy.observation_space.shape[0],
+        action_dim=dummy.action_space.n
+    )
+    model.load_state_dict(torch.load(model_pth, map_location='cpu'))
+    model.eval()
+
+    # --- Run tests & collect results ---
+    results = []
+    for hla_string in real_hlas:
+        subG = make_subgraph_for_hla(G_full, hla_string)
+        brute = brute_force_best(subG)
+        ac_scr = eval_ac_best_of_n(hla_string, model, G_full, cfg, N_TRIALS)
+        results.append((hla_string, brute, ac_scr))
+        print(f"REAL          | brute={brute:.3f}, AC={ac_scr:.3f}")
+
+    for i in range(1, n_sub + 1):
+        hla_string = random_hla_string(alleles_by_locus, loci)
+        subG = make_subgraph_for_hla(G_full, hla_string)
+        brute = brute_force_best(subG)
+        ac_scr = eval_ac_best_of_n(hla_string, model, G_full, cfg, N_TRIALS)
+        results.append((hla_string, brute, ac_scr))
+        print(f"RANDOM [{i}/{n_sub}] | brute={brute:.3f}, AC={ac_scr:.3f}")
+
+    # --- Save results ---
+    out_csv = os.path.join(graph_dir, 'test_results.csv')
+    with open(out_csv, 'w', newline='') as cf:
+        writer = csv.writer(cf)
+        writer.writerow(['HLA', 'score_with_brute_force', 'score_with_actor_critic'])
+        writer.writerows(results)
+    print(f"\nSaved results to {out_csv}")
+
+
+if __name__ == "__main__":
+    main()

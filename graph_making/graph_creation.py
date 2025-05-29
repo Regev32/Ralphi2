@@ -1,119 +1,99 @@
-import os
 import json
 import pandas as pd
 from itertools import groupby
 import networkx as nx
+import os
 import pickle
 from tqdm import tqdm
 
-# 1) Determine your project root (one level up from this script)
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 
-# 2) Load config.json from project root
-CONFIG_PATH = os.path.join(BASE_DIR, 'config.json')
-with open(CONFIG_PATH, 'r') as f:
-    cfg = json.load(f)
+def create_allele_dict(hla_list, config):
+    allele_dict = {
+        f"{locus}": set()
+        for locus in config['allowed_loci']
+    }
 
-# 3) Build these once
-DONORS_CSV = os.path.join(
-    BASE_DIR,
-    cfg['donors_folder'],
-    cfg['donors_file'] + '.csv'
-)
-GRAPH_DIR    = os.path.join(BASE_DIR, cfg['graph_path'])
-OUTPUT_PKL   = os.path.join(GRAPH_DIR, cfg['donors_file'] + '.pkl')
-LOCI_OUTPUT  = os.path.join(GRAPH_DIR, cfg['donors_file'] + '_loci.json')
-# Ensure output directory exists
-os.makedirs(GRAPH_DIR, exist_ok=True)
+    for hla in tqdm(hla_list, desc="Creating allele dictionary"):
+        for locus in hla:
+            for allele in locus:
+                for node in allele:
+                    if node.split('*')[0] == "nan":
+                        pass
+                    else:
+                        allele_dict[f"{node.split('*')[0]}"].add(node)
+
+    # now convert to JSON‐friendly lists
+    json_ready = {
+        key: sorted(vals)
+        for key, vals in allele_dict.items()
+    }
+
+    json_path = '../' +  os.path.join(
+        config['graph_path'],
+        config['donors_file'] + '_allele.json'
+    )
+    with open(json_path, 'w') as nf:
+        json.dump(json_ready, nf, indent=2)
 
 
 def parse_hla_nested(hla_string):
     """
     Parse a raw HLA string into a nested list by locus.
-    Example input: "A*02:01+A*02:02^B*07:05+B*14:02^…"
     """
-    # Split into locus parts on '^', then split each on '+'
-    alleles = [
-        allele.strip()
-        for locus_part in hla_string.split('^')
-        for allele in locus_part.split('+')
-        if allele.strip()
-    ]
-    # Group by the part before the '*' so that we keep each locus together
     return [
         list(group)
-        for _, group in groupby(alleles, key=lambda a: a.split('*', 1)[0])
+        for locus, group in groupby(
+            [list(set(allele.split('/')))
+             for locus_part in hla_string.split('^')
+             for allele in locus_part.split('+')],
+            key=lambda x: x[0].split('*', 1)[0]
+        )
     ]
-
-
-def create_allele_dict(hla_list):
-    """
-    From a list of parsed HLAs (list of lists of allele-groups),
-    build a dict mapping locus -> unique set of allele-strings.
-    Then save to LOCI_OUTPUT.
-    """
-    allele_dict = {locus: set() for locus in cfg['allowed_loci']}
-
-    for entry in tqdm(hla_list, desc="Collecting alleles by locus"):
-        for locus_group in entry:
-            # locus name is first two chars before '*' (e.g. 'A')
-            locus_name = locus_group[0].split('*', 1)[0]
-            if locus_name in allele_dict:
-                allele_dict[locus_name].update(locus_group)
-
-    # Convert to sorted lists and dump JSON
-    allele_json = {locus: sorted(list(vals)) for locus, vals in allele_dict.items()}
-    with open(LOCI_OUTPUT, 'w') as f:
-        json.dump(allele_json, f, indent=2)
 
 
 def create_graph(hla_list):
-    """
-    Build the weighted co-occurrence graph:
-    For each HLA entry (list of locus-groups),
-    connect every allele in locus i to every allele in locus j
-    with weight = 1/(len(allele_i)*len(allele_j)), then sum across the dataset.
-    """
-    edge_weights = {}
-
-    for entry in tqdm(hla_list, desc="Accumulating edge weights"):
-        # flatten entry into per-locus lists
-        for i in range(len(entry) - 1):
-            for j in range(i + 1, len(entry)):
-                group_i = entry[i]
-                group_j = entry[j]
-                inv_denom = 1.0 / (len(group_i) * len(group_j))
-                for allele_i in group_i:
-                    for allele_j in group_j:
-                        key = tuple(sorted((allele_i, allele_j)))
-                        edge_weights[key] = edge_weights.get(key, 0.0) + inv_denom
-
+    graph_dict = {}
+    # Outer progress bar for HLA entries
+    for hla in tqdm(hla_list, desc="Building graph from HLA list"):
+        for i in range(len(hla) - 1):
+            locus1 = hla[i]
+            for j in range(i + 1, len(hla)):
+                locus2 = hla[j]
+                for allele1 in locus1:
+                    for allele2 in locus2:
+                        weight = (len(allele1) * len(allele2)) ** -1
+                        for node1 in allele1:
+                            for node2 in allele2:
+                                edge = (node1, node2)
+                                graph_dict[edge] = graph_dict.get(edge, 0) + weight
     G = nx.Graph()
-    for (u, v), w in edge_weights.items():
-        G.add_edge(u, v, weight=w)
+    G.add_weighted_edges_from((u, v, w) for (u, v), w in graph_dict.items())
     return G
 
 
-def main():
-    # 1) Read the CSV
-    if not os.path.isfile(DONORS_CSV):
-        raise FileNotFoundError(f"Could not find HLA CSV at {DONORS_CSV}")
-    df = pd.read_csv(DONORS_CSV, usecols=[1], header=0, names=['raw_hla'])
+def main(config_path="../config.json"):
+    # Load configuration
+    with open(config_path) as f:
+        cfg = json.load(f)
+    os.makedirs('../' + cfg['graph_path'], exist_ok=True)
 
-    # 2) Parse HLA strings
+    # Read only the HLA column
+    donors_csv = os.path.join(cfg['donors_folder'], cfg['donors_file'] + '.csv')
+    df = pd.read_csv('../' + donors_csv, usecols=[1], header=0, names=['raw_hla'])
+
+    # Parse each HLA string
     tqdm.pandas(desc="Parsing HLA strings")
     df['parsed_hla'] = df['raw_hla'].astype(str).progress_apply(parse_hla_nested)
     hla_list = df['parsed_hla'].tolist()
-
-    # 3) Build allele-dict JSON
-    create_allele_dict(hla_list)
-
-    # 4) Build the full co-occurrence graph and pickle it
+    create_allele_dict(hla_list, cfg)
+    # Build graph and save
     G = create_graph(hla_list)
-    with open(OUTPUT_PKL, 'wb') as f:
-        pickle.dump(G, f)
-    print(f"Saved full HLA graph to {OUTPUT_PKL}")
 
+    # Save graph object
+    out_file = '../' +  os.path.join(cfg['graph_path'], cfg['donors_file'] + '.pkl')
+    with open(out_file, 'wb') as f:
+        pickle.dump(G, f)
+    print(f"Graph saved to {out_file}")
 
 if __name__ == "__main__":
     main()

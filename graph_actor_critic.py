@@ -16,23 +16,10 @@ import random
 import itertools           # for combinations
 import matplotlib.pyplot as plt
 
-# Optional TensorBoard support
-try:
-    from torch.utils.tensorboard import SummaryWriter
-    TB_AVAILABLE = True
-except ImportError:
-    TB_AVAILABLE = False
-    class SummaryWriter:
-        def __init__(self, *args, **kwargs): pass
-        def add_scalar(self, *args, **kwargs): pass
-        def close(self): pass
 
 # Configure logging
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s %(levelname)s %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
-
-# Always resolve paths relative to this file
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 
 
@@ -197,6 +184,23 @@ class GraphPartitionEnv(gym.Env):
         return self._obs(), reward, done, {}
 
 
+    @property
+    def cliques(self):
+        """
+        Returns the two final cliques as lists of allele-group strings,
+        based on the current self.assign and self.alleles arrays.
+        """
+        clique1 = []
+        clique2 = []
+        for i in range(self.num_loci):
+            for j in (0, 1):
+                if self.assign[i, j] == 1:
+                    clique1.append(self.alleles[i, j])
+                else:
+                    clique2.append(self.alleles[i, j])
+        return clique1, clique2
+
+
 class ActorCritic(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_size=64):
         super().__init__()
@@ -222,9 +226,7 @@ class ActorCritic(nn.Module):
 
 
 def train(cfg):
-    donors_csv = os.path.join(BASE_DIR,
-                              cfg['donors_folder'],
-                              cfg['donors_file'] + '.csv')
+    donors_csv = os.path.join(BASE_DIR, cfg['donors_folder'], cfg['donors_file'] + '.csv')
     skip_header = cfg.get('first_row_headers', False)
     hla_list = []
     with open(donors_csv) as f:
@@ -243,11 +245,10 @@ def train(cfg):
     logdir   = cfg.get('logdir', 'runs')
 
     # build a fixed example HLA for consistent dims
-    loci_json = os.path.join(BASE_DIR,
-                             cfg['graph_path'],
-                             cfg['donors_file'] + '_loci.json')
+    loci_json = os.path.join(BASE_DIR, cfg['graph_path'], cfg['donors_file'] + '_allele.json')
     with open(loci_json) as lf:
         alleles_by_locus = json.load(lf)
+
     example = []
     for locus in cfg['allowed_loci']:
         vals = alleles_by_locus[locus]
@@ -263,7 +264,6 @@ def train(cfg):
 
     model     = ActorCritic(state_dim, action_dim).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    writer    = SummaryWriter(logdir) if TB_AVAILABLE else None
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
     rewards_history = []
@@ -323,8 +323,7 @@ def train(cfg):
     out_plot = os.path.join(os.path.dirname(save_path), 'training_rewards.png')
     plt.savefig(out_plot)
     logger.info(f"Training curve saved to {out_plot}")
-    if writer:
-        writer.close()
+
 
 
 if __name__ == "__main__":
