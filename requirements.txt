@@ -9,3 +9,4 @@ ast
 pandas
 itertools
 tqdm
+gymnasium

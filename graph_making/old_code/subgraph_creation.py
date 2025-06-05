@@ -6,7 +6,7 @@ import networkx as nx
 # ------------------
 # Configuration
 # ------------------
-CONFIG_PATH = "../config.json"
+CONFIG_PATH = "../../config.json"
 HLA_STRING = (
     "A*01:01+A*02:01/A*02:02^"
     "B*07:33+B*14:02^"

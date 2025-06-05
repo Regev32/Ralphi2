@@ -13,9 +13,9 @@ import torch.optim as optim
 from torch.distributions import Categorical
 import logging
 import random
-import itertools           # for combinations
+import itertools
 import matplotlib.pyplot as plt
-
+from itertools import groupby
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -23,18 +23,19 @@ logger = logging.getLogger(__name__)
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 
 
-def parse_groups(hla_string):
+def parse_hla_nested(hla_string):
     """
-    Split on '^' then '+'; keep '/' inside each chunk.
-    Returns a list of group-strings.
+    Parse a raw HLA string into a nested list by locus.
     """
-    groups = []
-    for locus_part in hla_string.split('^'):
-        for chunk in locus_part.split('+'):
-            g = chunk.strip()
-            if g:
-                groups.append(g)
-    return groups
+    return [
+        list(group)
+        for locus, group in groupby(
+            [list(set(allele.split('/')))
+             for locus_part in hla_string.split('^')
+             for allele in locus_part.split('+')],
+            key=lambda x: x[0].split('*', 1)[0]
+        )
+    ]
 
 
 def build_subgraph_for_hla(groups, G_full):
@@ -43,23 +44,34 @@ def build_subgraph_for_hla(groups, G_full):
     build an unweighted subgraph whose nodes are exactly those groups,
     inheriting and summing any edges present in G_full.
     """
-    var2grp = {v: grp for grp in groups for v in grp.split('/')}
+    var2grp = {}
+    group_nodes = []
+    for locus in groups:
+        for subgroup in locus:
+            grp_str = "/".join(subgroup)
+            group_nodes.append(grp_str)
+            for allele in subgroup:
+                var2grp[allele] = grp_str
+
     sub = nx.Graph()
-    sub.add_nodes_from(groups)
-    for grp in groups:
-        for var in grp.split('/'):
-            if var not in G_full:
+    sub.add_nodes_from(group_nodes)
+
+    for grp_str in group_nodes:
+        for allele in grp_str.split("/"):
+            if allele not in G_full:
                 continue
-            for nbr, data in G_full[var].items():
-                if nbr in var2grp:
-                    tgt = var2grp[nbr]
-                    if tgt == grp:
-                        continue
-                    w = data.get('weight', 1.0)
-                    if sub.has_edge(grp, tgt):
-                        sub[grp][tgt]['weight'] += w
-                    else:
-                        sub.add_edge(grp, tgt, weight=w)
+            for nbr, data in G_full[allele].items():
+                if nbr not in var2grp:
+                    continue
+                tgt_grp = var2grp[nbr]
+                if tgt_grp == grp_str:
+                    continue
+                w = data.get("weight", 0)
+                if sub.has_edge(grp_str, tgt_grp):
+                    sub[grp_str][tgt_grp]["weight"] += w
+                else:
+                    sub.add_edge(grp_str, tgt_grp, weight=w)
+
     return sub
 
 
@@ -101,7 +113,7 @@ class GraphPartitionEnv(gym.Env):
         self.G_full = GraphPartitionEnv._cached_full_graph
 
         # Parse groups and build subgraph
-        parsed     = parse_groups(hla_string)
+        parsed     = parse_hla_nested(hla_string)
         self.G_sub = build_subgraph_for_hla(parsed, self.G_full)
 
         # Fixed world of groups
@@ -124,27 +136,46 @@ class GraphPartitionEnv(gym.Env):
         self.reset()
 
     def reset(self):
-        # Random assignment and allele picks
+        # Random “phase‐assignment” and allele‐choices
+        # ------------------------------------------------
+        # assign[i, j] ∈ {+1, −1} says which clique allele (i,j) belongs to.
         self.assign = np.random.choice([1, -1], size=(self.num_loci, 2))
-        self.alleles = np.empty((self.num_loci, 2), dtype=object)
-        for i, grp in enumerate(self.groups):
-            opts = grp.split('/')
-            self.alleles[i, 0] = random.choice(opts)
-            self.alleles[i, 1] = random.choice(opts)
 
-        self.step_count  = 0
+        # alleles[i, 0] will come from self.groups[i][0]
+        # alleles[i, 1] will come from self.groups[i][1]
+        self.alleles = np.empty((self.num_loci, 2), dtype=object)
+        for i, locus in enumerate(self.groups):
+            # locus == [ subgroup0_list, subgroup1_list ]
+            subgroup0, subgroup1 = locus[0], locus[1]
+            self.alleles[i, 0] = random.choice(subgroup0)
+            self.alleles[i, 1] = random.choice(subgroup1)
+
+        self.step_count = 0
         self.prev_weight = self._calc_weight()
-        # compute normalization constant
         self.max_possible = brute_force_best(self.G_sub) or 1.0
         return self._obs()
 
     def _obs(self):
+        """
+        Observation is a 1D array of length 4 * num_loci:
+          – first 2*num_loci entries = flattened "assign" (each ∈ {+1,−1} cast to float32),
+          – next 2*num_loci entries = “index‐within‐its‐subgroup” for each allele‐slot.
+        """
         assign_flat = self.assign.flatten().astype(np.float32)
-        allele_idx  = []
-        for i, grp in enumerate(self.groups):
-            opts = grp.split('/')
-            allele_idx.append(opts.index(self.alleles[i, 0]))
-            allele_idx.append(opts.index(self.alleles[i, 1]))
+
+        allele_idx = []
+        for i, locus in enumerate(self.groups):
+            # locus == [ subgroup0_list, subgroup1_list ]
+            subgroup0, subgroup1 = locus[0], locus[1]
+
+            # find index of the chosen allele in subgroup0
+            idx0 = subgroup0.index(self.alleles[i, 0])
+            # find index of the chosen allele in subgroup1
+            idx1 = subgroup1.index(self.alleles[i, 1])
+
+            allele_idx.append(float(idx0))
+            allele_idx.append(float(idx1))
+
         return np.concatenate([assign_flat, np.array(allele_idx, dtype=np.float32)])
 
     def _calc_weight(self):
@@ -162,27 +193,33 @@ class GraphPartitionEnv(gym.Env):
 
     def step(self, action):
         locus = action // 4
-        op    = action % 4
+        op = action % 4
 
+        # 1) possible “flip phase” on this locus:
         if op == 0:
             self.assign[locus] *= -1
 
-        opts = self.groups[locus].split('/')
-        if op in (1, 3):
-            self.alleles[locus, 0] = random.choice(opts)
-        if op in (2, 3):
-            self.alleles[locus, 1] = random.choice(opts)
+        # 2) pick from each subgroup separately
+        subgroup0, subgroup1 = self.groups[locus][0], self.groups[locus][1]
 
+        # op == 1: re‐sample allele in column 0 (i.e. from subgroup0)
+        # op == 2: re‐sample allele in column 1 (i.e. from subgroup1)
+        # op == 3: re‐sample both at once
+        if op in (1, 3):
+            self.alleles[locus, 0] = random.choice(subgroup0)
+        if op in (2, 3):
+            self.alleles[locus, 1] = random.choice(subgroup1)
+
+        # 3) compute new weight and reward
         current_weight = self._calc_weight()
-        raw_delta      = current_weight - self.prev_weight
-        # normalize reward
-        reward         = self.alpha * (raw_delta / self.max_possible)
+        raw_delta = current_weight - self.prev_weight
+        reward = self.alpha * (raw_delta / self.max_possible)
         self.prev_weight = current_weight
 
+        # 4) increment step count, check done
         self.step_count += 1
         done = (self.step_count >= self.max_steps)
         return self._obs(), reward, done, {}
-
 
     @property
     def cliques(self):
@@ -242,7 +279,6 @@ def train(cfg):
     lr       = cfg.get('lr', 3e-4)
     gamma    = cfg.get('gamma', 0.99)
     save_path= cfg.get('save_model', 'models/actor_critic.pth')
-    logdir   = cfg.get('logdir', 'runs')
 
     # build a fixed example HLA for consistent dims
     loci_json = os.path.join(BASE_DIR, cfg['graph_path'], cfg['donors_file'] + '_allele.json')

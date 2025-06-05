@@ -1,13 +1,13 @@
 {
   "donors_folder": "data/typing",
-  "donors_file": "ezer_mizion_16",
+  "donors_file": "length10.txt",
   "allowed_loci": ["A", "B", "C", "DRB1", "DQB1"],
   "first_row_headers": false,
   "graph_path": "graphs",
   "output_html": "hla_graph.html",
   "nodes_list": "nodes.json",
 
-  "episodes":   500,
+  "episodes":   1000,
   "lr":         1e-4,
   "gamma":      0.99,
   "alpha":      1,

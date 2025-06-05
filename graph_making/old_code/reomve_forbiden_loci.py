@@ -17,7 +17,7 @@ def filter_hla_loci(hla_string, allowed_loci):
 
 def main():
     # --- load config ---
-    config     = load_config('../config.json')
+    config     = load_config('../../config.json')
     donors_csv = os.path.join(config['donors_folder'], config['donors_file'] + '.csv')
     allowed    = config['allowed_loci']
     hdr        = 0 if config['first_row_headers'] else None
