@@ -1,6 +1,6 @@
 {
   "donors_folder": "data/typing",
-  "donors_file": "length10.txt",
+  "donors_file": "",
   "allowed_loci": ["A", "B", "C", "DRB1", "DQB1"],
   "first_row_headers": false,
   "graph_path": "graphs",
@@ -13,8 +13,6 @@
   "alpha":      1,
   "max_steps":  200,
 
-  "n_real_hlas": 5,
-  "n_trials": 20,
   "n_subgraphs": 10,
 
   "save_model": "models/actor_critic.pth",

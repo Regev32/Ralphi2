@@ -6,11 +6,10 @@ import json
 import pickle as pkl
 import os
 
-def calculate_clique_weight( alleles = None, conf_path = "../../config.json"):
+def calculate_clique_weight( alleles = None, conf_path = "../config.json"):
     with open(conf_path) as json_file:
         CONF = json.load(json_file)
-
-    graph_path = os.path.join("..", "..", CONF['graph_path'], CONF['donors_file'] + '.pkl')
+    graph_path = os.path.join("..", CONF['graph_path'], CONF['donors_file'] + '.pkl')
     with open(graph_path, 'rb') as f:
         G = pkl.load(f)
     return sum(
@@ -47,8 +46,8 @@ class CliqueEnv(gym.Env):
 
         # Internal state: which list from each partition goes to clique1, and which node-indices are chosen
         self.which_side = np.zeros(self.num_partitions, dtype=np.int64)
-        self.choice1    = np.zeros(self.num_partitions, dtype=np.int64)
-        self.choice2    = np.zeros(self.num_partitions, dtype=np.int64)
+        self.choice1    = [None] * self.num_partitions
+        self.choice2    = [None] * self.num_partitions
         self._step_count = 0
         self._prev_sum   = 0.0
         self._total_graph_weight = 1.0  # will be overwritten in reset()
@@ -79,6 +78,8 @@ class CliqueEnv(gym.Env):
                           ),
         }
         self.observation_space = spaces.Dict(obs_spaces)
+        with open("../graphs/indexes.json", "r") as f:
+            self.tokenizer = json.load(f)
 
     def _get_obs(self) -> dict:
         return {
@@ -93,13 +94,15 @@ class CliqueEnv(gym.Env):
         """
         clique1 = []
         clique2 = []
+        tokenizer = None
+
         for i in range(self.num_partitions):
             side = int(self.which_side[i])      # 0 or 1
             list_c1 = self.graph_partitions[i][side]
             list_c2 = self.graph_partitions[i][1 - side]
 
-            idx1 = int(self.choice1[i])
-            idx2 = int(self.choice2[i])
+            idx1 = int(self.tokenizer[self.choice1[i]])
+            idx2 = int(self.tokenizer[self.choice2[i]])
 
             # Clamp to valid indices
             idx1 = np.clip(idx1, 0, len(list_c1) - 1)
@@ -130,24 +133,31 @@ class CliqueEnv(gym.Env):
         return float(calculate_clique_weight(all_nodes))
 
     def reset(
-        self,
-        *,
-        seed: int = None,
-        options: dict = None
+            self,
+            *,
+            seed: int = None,
+            options: dict = None
     ) -> Tuple[dict, dict]:
         super().reset(seed=seed)
 
         # 1) Randomly assign which_side[i] ∈ {0,1}
-        self.which_side = self.np_random.integers(0, 2, size=(self.num_partitions,), dtype=np.int64)
+        self.which_side = self.np_random.integers(
+            0, 2, size=(self.num_partitions,), dtype=np.int64
+        )
 
-        # 2) For each partition i, pick a random node-index for clique1 & clique2
+        # 2) For each partition i, pick a random allele for clique1 & clique2
         for i in range(self.num_partitions):
             side = int(self.which_side[i])
             list_c1 = self.graph_partitions[i][side]
             list_c2 = self.graph_partitions[i][1 - side]
 
-            self.choice1[i] = self.np_random.integers(0, len(list_c1))
-            self.choice2[i] = self.np_random.integers(0, len(list_c2))
+            # draw random indices into each list
+            idx1 = int(self.np_random.integers(0, len(list_c1)))
+            idx2 = int(self.np_random.integers(0, len(list_c2)))
+
+            # store the actual allele strings
+            self.choice1[i] = list_c1[idx1]
+            self.choice2[i] = list_c2[idx2]
 
         self._step_count = 0
 
@@ -159,8 +169,8 @@ class CliqueEnv(gym.Env):
         return obs, {}
 
     def step(
-        self,
-        action: int
+            self,
+            action: int
     ) -> Tuple[dict, float, bool, bool, dict]:
         self._step_count += 1
 
@@ -178,43 +188,48 @@ class CliqueEnv(gym.Env):
             raise ValueError(f"Action {action} out of range [0..{self.total_actions - 1}]")
         i = partition_i
 
-        # (B) Determine sizes for the “currently assigned” lists in partition i
-        n0 = len(self.graph_partitions[i][0])
-        n1 = len(self.graph_partitions[i][1])
+        # (B) Grab current lists
         side = int(self.which_side[i])
-        size_c1 = len(self.graph_partitions[i][side])
-        size_c2 = len(self.graph_partitions[i][1 - side])
+        list_c1 = self.graph_partitions[i][side]
+        list_c2 = self.graph_partitions[i][1 - side]
 
-        # (C) Decode local_id:
+        # (C) Decode local_id
         if local_id == 0:
             # FLIP which_side[i]
-            self.which_side[i] = 1 - self.which_side[i]
+            self.which_side[i] = 1 - side
             new_side = int(self.which_side[i])
-            new_size_c1 = len(self.graph_partitions[i][new_side])
-            new_size_c2 = len(self.graph_partitions[i][1 - new_side])
-            # Clamp the old choices
-            self.choice1[i] = np.clip(self.choice1[i], 0, new_size_c1 - 1)
-            self.choice2[i] = np.clip(self.choice2[i], 0, new_size_c2 - 1)
-        else:
-            # local_id in [1 .. size_c1] → set choice1[i]
-            if 1 <= local_id <= size_c1:
-                self.choice1[i] = local_id - 1
-            # local_id in [1+size_c1 .. 1+size_c1+size_c2-1] → set choice2[i]
-            elif 1 + size_c1 <= local_id < 1 + size_c1 + size_c2:
-                self.choice2[i] = local_id - (1 + size_c1)
-            # Otherwise, ignore
+            new_list_c1 = self.graph_partitions[i][new_side]
+            new_list_c2 = self.graph_partitions[i][1 - new_side]
 
-        # (D) Compute new sum, then normalized reward = (new_sum – prev_sum) / total_graph_weight
+            # If the old allele is no longer in the new list, re‑sample
+            if self.choice1[i] not in new_list_c1:
+                idx = int(self.np_random.integers(0, len(new_list_c1)))
+                self.choice1[i] = new_list_c1[idx]
+            if self.choice2[i] not in new_list_c2:
+                idx = int(self.np_random.integers(0, len(new_list_c2)))
+                self.choice2[i] = new_list_c2[idx]
+
+        else:
+            # A non‑flip action picks from the *current* lists
+            # local_id in [1 .. len(list_c1)] → set choice1
+            if 1 <= local_id <= len(list_c1):
+                idx = local_id - 1
+                self.choice1[i] = list_c1[idx]
+            # local_id in [1+len(list_c1) .. 1+len(list_c1)+len(list_c2)-1] → set choice2
+            elif 1 + len(list_c1) <= local_id < 1 + len(list_c1) + len(list_c2):
+                idx = local_id - (1 + len(list_c1))
+                self.choice2[i] = list_c2[idx]
+            # else: ignore
+
+        # (D) Compute reward
         new_sum = self._compute_sum()
-        raw_delta = new_sum - self._prev_sum
-        reward = raw_delta / max(self._total_graph_weight, 1e-12)  # avoid division by zero
+        delta = new_sum - self._prev_sum
+        reward = delta / max(self._total_graph_weight, 1e-12)
         self._prev_sum = new_sum
 
-        # (E) Termination by step count
+        # (E) Termination
         terminated = False
-        truncated = False
-        if self._step_count >= self.max_steps:
-            truncated = True
+        truncated = (self._step_count >= self.max_steps)
 
         obs = self._get_obs()
         return obs, float(reward), terminated, truncated, {}

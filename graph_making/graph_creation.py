@@ -4,6 +4,22 @@ import networkx as nx
 import os
 import pickle
 from tqdm import tqdm
+from itertools import groupby
+
+
+def parse_hla_nested(hla_string):
+    """
+    Parse a raw HLA string into a nested list by locus.
+    """
+    return [
+        list(group)
+        for locus, group in groupby(
+            [list(set(allele.split('/')))
+             for locus_part in hla_string.split('^')
+             for allele in locus_part.split('+')],
+            key=lambda x: x[0].split('*', 1)[0]
+        )
+    ]
 
 
 def create_allele_dict(hla_list, config):
@@ -34,7 +50,10 @@ def create_graph(hla_list):
                 locus2 = hla[j]
                 for chromosome1 in locus1:
                     for chromosome2 in locus2:
-                        weight = (len(chromosome1) * len(chromosome2)) ** -1
+                        weight = (len(chromosome1) * len(chromosome2))
+                        if weight > 50:
+                            continue
+                        weight = weight ** -1
                         for node1 in chromosome1:
                             for node2 in chromosome2:
                                 edge = (node1, node2)
@@ -50,7 +69,7 @@ def main(config_path="../config.json"):
         cfg = json.load(f)
     os.makedirs('../' + cfg['graph_path'], exist_ok=True)
 
-    path = os.path.join('..', cfg['donors_folder'], cfg['donors_file'])
+    path = f"../{cfg['donors_folder']}/length10{cfg['donors_file']}.txt"
     hla_list = []
 
     with open(path, 'r') as f:
@@ -74,5 +93,15 @@ def main(config_path="../config.json"):
         pickle.dump(G, f)
     print(f"Graph saved to {out_file}")
 
+
+    i = 0
+    tokenizer = {}
+    for key in json_ready.keys():
+        for value in json_ready[key]:
+            tokenizer[value] = i
+            i += 1
+
+    with open("../graphs/indexes.json", "w") as f:
+        json.dump(tokenizer, f, indent=2)
 if __name__ == "__main__":
     main()
